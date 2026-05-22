@@ -1,8 +1,13 @@
 import numpy as np
 import pandas as pd
+from typing import Optional
 
 
-def generate_fusion_data(n_steps: int = 200, noise_level: float = 0.2) -> pd.DataFrame:
+def generate_fusion_data(
+    n_steps: int = 200,
+    noise_level: float = 0.2,
+    seed: Optional[int] = None,
+) -> pd.DataFrame:
     """
     Simulate plasma dynamics with physically coupled signals.
 
@@ -16,30 +21,38 @@ def generate_fusion_data(n_steps: int = 200, noise_level: float = 0.2) -> pd.Dat
 
     Parameters
     ----------
-    n_steps     : number of time steps to simulate
+    n_steps     : number of time steps to simulate (must be >= 60)
     noise_level : scaling factor for stochastic noise (0 = deterministic)
+    seed        : optional integer seed for reproducible output
 
     Returns
     -------
     pd.DataFrame with columns: time, temperature, pressure, magnetic_field
+
+    Raises
+    ------
+    ValueError if n_steps < 60
     """
-    rng = np.random.default_rng()  # reproducible seeding possible via seed=
+    if n_steps < 60:
+        raise ValueError(f"n_steps must be >= 60 for valid trend analysis, got {n_steps}")
+
+    rng = np.random.default_rng(seed)
     t = np.arange(n_steps)
 
     # ------------------------------------------------------------------ #
     # Temperature  — Ornstein–Uhlenbeck mean-reverting process             #
     #   dT = theta*(mu - T)*dt + sigma*dW                                 #
     # ------------------------------------------------------------------ #
-    mu_temp   = 500.0          # long-run mean (keV proxy, scaled)
-    theta     = 0.04           # mean-reversion speed
-    sigma_t   = 40.0 * noise_level
+    mu_temp = 500.0          # long-run mean (keV proxy, scaled)
+    theta   = 0.04           # mean-reversion speed
+    sigma_t = 40.0 * noise_level
 
     temperature = np.empty(n_steps)
     temperature[0] = mu_temp + rng.normal(0, sigma_t)
 
     for i in range(1, n_steps):
-        drift     = theta * (mu_temp - temperature[i - 1])
-        diffusion = sigma_t * rng.normal()
+        drift         = theta * (mu_temp - temperature[i - 1])
+        diffusion     = sigma_t * rng.normal()
         temperature[i] = temperature[i - 1] + drift + diffusion
 
     # Add a slow oscillation (plasma heating cycle)
@@ -68,8 +81,8 @@ def generate_fusion_data(n_steps: int = 200, noise_level: float = 0.2) -> pd.Dat
     )
 
     return pd.DataFrame({
-        "time":          t,
-        "temperature":   np.clip(temperature,   200.0, 1500.0),
-        "pressure":      np.clip(pressure,        0.0,   25.0),
-        "magnetic_field": np.clip(magnetic_field, 0.0,    6.0),
+        "time":           t,
+        "temperature":    np.clip(temperature,    200.0, 1500.0),
+        "pressure":       np.clip(pressure,         0.0,   25.0),
+        "magnetic_field": np.clip(magnetic_field,   0.0,    6.0),
     })

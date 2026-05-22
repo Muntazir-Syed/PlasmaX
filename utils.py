@@ -1,10 +1,13 @@
 import numpy as np
 import json
 import os
+import uuid
 from datetime import datetime
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
-EXPERIMENT_DIR = "experiments"
+import pandas as pd
+
+EXPERIMENT_DIR = os.environ.get("PLASMX_EXPERIMENT_DIR", "experiments")
 
 # ------------------------------------------------------------------ #
 # PHYSICAL SAFETY THRESHOLDS (documented)                             #
@@ -19,12 +22,16 @@ PRESSURE_WARN  = 12.0
 MAG_CRIT       = 0.8
 MAG_WARN       = 1.0
 
+# Distressed thresholds used consistently in BOTH safety and prediction
+# A signal is "distressed" if its component score >= this fraction of its max
+_DISTRESSED_SCORE_MIN = 9   # matches lowest non-zero tier across all components
+
 
 # ------------------------------------------------------------------ #
 # SAFETY SYSTEM                                                        #
 # ------------------------------------------------------------------ #
 def check_plasma_safety(
-    data,
+    data: pd.DataFrame,
 ) -> Tuple[str, str, List[Tuple[str, str]]]:
     """
     Evaluate plasma safety from both the latest readings AND recent trends.
@@ -46,7 +53,9 @@ def check_plasma_safety(
     pressure = float(data["pressure"].iloc[-1])
     mag      = float(data["magnetic_field"].iloc[-1])
 
-    # Trend over the last 20 steps (rate of change per step)
+    # Trend over the last 20 steps (mean pairwise difference = rate/step)
+    # np.diff reduces length by 1, so window=20 yields 19 differences — this
+    # is intentional and documented here to avoid confusion.
     window = min(20, len(data))
     t_rate = float(np.mean(np.diff(data["temperature"].values[-window:])))
     p_rate = float(np.mean(np.diff(data["pressure"].values[-window:])))
@@ -60,7 +69,6 @@ def check_plasma_safety(
     elif temp > TEMP_WARNING:
         alerts.append(("warning", f"Elevated temperature ({temp:.1f})"))
     elif t_rate > 5.0 and temp > TEMP_WARNING * 0.85:
-        # Not yet at warning threshold but climbing fast toward it
         alerts.append(("warning", f"Temperature rising rapidly (+{t_rate:.1f}/step, now {temp:.1f})"))
 
     # ---- Pressure ----
@@ -77,7 +85,6 @@ def check_plasma_safety(
     elif mag < MAG_WARN:
         alerts.append(("warning", f"Weakening magnetic confinement ({mag:.3f} T)"))
     elif m_rate < -0.02 and mag < MAG_WARN * 1.20:
-        # Field is eroding and already close to the warning band
         alerts.append(("warning", f"Magnetic field declining ({m_rate:.3f} T/step, now {mag:.3f} T)"))
 
     if any(a[0] == "critical" for a in alerts):
@@ -92,10 +99,12 @@ def check_plasma_safety(
 # ------------------------------------------------------------------ #
 # AI PREDICTION ENGINE  (multi-signal, weighted risk model)           #
 # ------------------------------------------------------------------ #
-def predict_instability(data) -> Dict[str, Any]:
+def predict_instability(data: pd.DataFrame) -> Dict[str, Any]:
     """
     Estimate plasma collapse risk from temperature, pressure, and
     magnetic-field signals combined.
+
+    Requires data to have at least 60 rows (enforced by generate_fusion_data).
 
     Scoring (max 100):
     - Temperature level & volatility  : up to 40 pts
@@ -106,19 +115,28 @@ def predict_instability(data) -> Dict[str, Any]:
                                          concurrent failures are disproportionately
                                          dangerous (compound instability).
     Final score is clamped to 100.
+
+    A signal is "distressed" when its component score >= _DISTRESSED_SCORE_MIN,
+    the same threshold used by check_plasma_safety's warning tier, ensuring the
+    two subsystems agree on what "distressed" means.
     """
-    temp  = data["temperature"].values
-    pres  = data["pressure"].values
-    mag   = data["magnetic_field"].values
+    n = len(data)
+    temp = data["temperature"].values
+    pres = data["pressure"].values
+    mag  = data["magnetic_field"].values
+
+    # Safe slice sizes — always use at most n//2 for trend windows so the
+    # early and late windows never overlap, even on short runs.
+    half = max(1, n // 2)
+    trend_window = min(30, half)
 
     score = 0
-    # Track which signal categories are actively distressed (for interaction term)
     distressed: List[str] = []
 
     # ---- Temperature component (max 40) ----
     t_latest     = temp[-1]
     t_volatility = float(np.std(np.diff(temp)))
-    t_trend      = float(np.mean(temp[-30:]) - np.mean(temp[:30]))
+    t_trend      = float(np.mean(temp[-trend_window:]) - np.mean(temp[:trend_window]))
 
     t_score = 0
     if t_latest > TEMP_CRITICAL:
@@ -137,12 +155,12 @@ def predict_instability(data) -> Dict[str, Any]:
         t_score += 4
 
     score += t_score
-    if t_score >= 10:
+    if t_score >= _DISTRESSED_SCORE_MIN:
         distressed.append("temperature")
 
     # ---- Pressure component (max 30) ----
     p_latest = float(pres[-1])
-    p_trend  = float(np.mean(pres[-20:]) - np.mean(pres[:20]))
+    p_trend  = float(np.mean(pres[-trend_window:]) - np.mean(pres[:trend_window]))
 
     p_score = 0
     if p_latest > PRESSURE_CRIT:
@@ -156,12 +174,12 @@ def predict_instability(data) -> Dict[str, Any]:
         p_score += 6
 
     score += p_score
-    if p_score >= 9:
+    if p_score >= _DISTRESSED_SCORE_MIN:
         distressed.append("pressure")
 
     # ---- Magnetic field component (max 30) ----
-    m_latest  = float(mag[-1])
-    m_trend   = float(np.mean(mag[-20:]) - np.mean(mag[:20]))  # negative = declining
+    m_latest = float(mag[-1])
+    m_trend  = float(np.mean(mag[-trend_window:]) - np.mean(mag[:trend_window]))
 
     m_score = 0
     if m_latest < MAG_CRIT:
@@ -175,21 +193,18 @@ def predict_instability(data) -> Dict[str, Any]:
         m_score += 6
 
     score += m_score
-    if m_score >= 9:
+    if m_score >= _DISTRESSED_SCORE_MIN:
         distressed.append("magnetic_field")
 
     # ---- Multi-signal interaction bonus ----
     # Two signals distressed simultaneously: +10 pts
     # All three simultaneously: +15 pts
-    # Rationale: compound instability (e.g. rising pressure AND collapsing field)
-    # escalates collapse risk non-linearly — each failure mode reinforces the others.
     n_distressed = len(distressed)
     if n_distressed == 3:
         score += 15
     elif n_distressed == 2:
         score += 10
 
-    # ---- Classification ----
     score = min(score, 100)
 
     if score >= 70:
@@ -215,16 +230,41 @@ def predict_instability(data) -> Dict[str, Any]:
 # ------------------------------------------------------------------ #
 # EXPERIMENT STORAGE                                                   #
 # ------------------------------------------------------------------ #
+def _unique_run_id(session_ts: str, cycle: int) -> str:
+    """
+    Generate a collision-resistant run ID.
+    Appends a 6-char UUID hex fragment so concurrent sessions started in the
+    same second can never overwrite each other's files.
+    """
+    uid = uuid.uuid4().hex[:6]
+    return f"{session_ts}_cycle_{cycle:03d}_{uid}"
+
+
 def save_experiment(
     run_id: str,
-    data,
+    data: pd.DataFrame,
     prediction: Dict[str, Any],
     status: str,
+    experiment_dir: str = EXPERIMENT_DIR,
 ) -> str:
-    """Persist a single experiment run to <EXPERIMENT_DIR>/<run_id>.json."""
-    os.makedirs(EXPERIMENT_DIR, exist_ok=True)
+    """
+    Persist a single experiment run to <experiment_dir>/<run_id>.json.
 
-    file_path = os.path.join(EXPERIMENT_DIR, f"{run_id}.json")
+    Parameters
+    ----------
+    run_id         : unique identifier for this run
+    data           : DataFrame with time, temperature, pressure, magnetic_field
+    prediction     : dict returned by predict_instability
+    status         : 'stable' | 'warning' | 'critical'
+    experiment_dir : override the default storage directory (useful for tests)
+
+    Returns
+    -------
+    Absolute path of the written JSON file.
+    """
+    os.makedirs(experiment_dir, exist_ok=True)
+
+    file_path = os.path.join(experiment_dir, f"{run_id}.json")
 
     record = {
         "run_id":     run_id,
@@ -239,10 +279,9 @@ def save_experiment(
             "mag_min":     float(data["magnetic_field"].min()),
             "mag_mean":    float(data["magnetic_field"].mean()),
         },
-        # Store full data for replay / charting
         "data": {
-            "temperature":   data["temperature"].tolist(),
-            "pressure":      data["pressure"].tolist(),
+            "temperature":    data["temperature"].tolist(),
+            "pressure":       data["pressure"].tolist(),
             "magnetic_field": data["magnetic_field"].tolist(),
         },
     }
@@ -250,45 +289,53 @@ def save_experiment(
     with open(file_path, "w") as f:
         json.dump(record, f, indent=2)
 
-    return file_path
+    return os.path.abspath(file_path)
 
 
 # ------------------------------------------------------------------ #
 # LOAD EXPERIMENTS                                                      #
 # ------------------------------------------------------------------ #
 def load_experiments(
-    limit: int = 10,
+    limit: Optional[int] = 10,
     include_data: bool = False,
+    experiment_dir: str = EXPERIMENT_DIR,
 ) -> List[Dict[str, Any]]:
     """
-    Load experiment records from EXPERIMENT_DIR.
+    Load experiment records from experiment_dir.
 
     Parameters
     ----------
-    limit        : max number of most-recent records to return (default 10).
-                   Pass None to load all.
-    include_data : if False (default), the 'data' key (full signal arrays) is
-                   stripped from each record — saving significant memory when
-                   only the archive summary view is needed.
+    limit          : max number of most-recent records to return.
+                     Pass None to load all.
+    include_data   : if False (default), the 'data' key (full signal arrays) is
+                     stripped — saving significant memory for summary views.
+    experiment_dir : override the default storage directory (useful for tests)
 
-    Corrupt or unreadable JSON files are silently skipped.
+    Notes
+    -----
+    Records are sorted by the ISO 'timestamp' field inside the JSON, not by
+    filesystem mtime, to avoid ordering anomalies from clock skew or file
+    copies. Corrupt or unreadable JSON files are silently skipped.
+
+    Returns
+    -------
+    List of experiment dicts in chronological order (oldest first).
     """
-    if not os.path.exists(EXPERIMENT_DIR):
+    if not os.path.exists(experiment_dir):
         return []
 
-    # Collect (mtime, filepath) so we can sort cheaply by filesystem mtime
-    # without reading every file — then read only the newest `limit` files.
+    # Cheap mtime pre-sort so we only parse the newest `limit` files —
+    # avoids reading thousands of JSON blobs when limit is small.
     entries: List[Tuple[float, str]] = []
-    for fname in os.listdir(EXPERIMENT_DIR):
+    for fname in os.listdir(experiment_dir):
         if not fname.endswith(".json"):
             continue
-        fpath = os.path.join(EXPERIMENT_DIR, fname)
+        fpath = os.path.join(experiment_dir, fname)
         try:
             entries.append((os.path.getmtime(fpath), fpath))
         except OSError:
             continue
 
-    # Sort newest-first, then take only what we need before reading any JSON
     entries.sort(key=lambda x: x[0], reverse=True)
     if limit is not None:
         entries = entries[:limit]
@@ -301,22 +348,29 @@ def load_experiments(
             if not all(k in record for k in ("run_id", "timestamp", "status", "prediction")):
                 continue
             if not include_data:
-                record.pop("data", None)   # drop full signal arrays from memory
+                record.pop("data", None)
             experiments.append(record)
         except (json.JSONDecodeError, OSError):
             continue
 
-    # Return in chronological order (oldest first) for display
+    # Final sort on the authoritative ISO timestamp inside the JSON record.
+    # ISO-8601 strings sort lexicographically = chronologically when the
+    # format is consistent (which datetime.now().isoformat() guarantees).
     return sorted(experiments, key=lambda x: x["timestamp"])
 
 
 # ------------------------------------------------------------------ #
 # DERIVED ANALYTICS HELPERS                                            #
 # ------------------------------------------------------------------ #
-def compute_session_stats(experiments: List[Dict[str, Any]]) -> Dict[str, Any]:
+def compute_session_stats(
+    experiments: List[Dict[str, Any]],
+) -> Dict[str, Any]:
     """
     Aggregate statistics across a list of experiment records.
-    Useful for the session summary panel.
+
+    Note: stats reflect only the records passed in. If load_experiments was
+    called with limit=10, these stats cover only those 10 runs — callers
+    should communicate this to the user (e.g. "Last 10 runs").
     """
     if not experiments:
         return {}
